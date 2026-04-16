@@ -1,0 +1,9 @@
+[package]
+name = "suipay"
+edition = "2024.beta" # Using the latest edition for better features
+
+[dependencies]
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
+
+[addresses]
+suipay = "0x0"
