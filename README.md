@@ -48,5 +48,4 @@ Ngay cả khi mất quyền truy cập vào phương thức đăng nhập chính
 - **Documentation**: cmdocs (MDX)
 
 
-Built with ❤️ for **CommandOSS Hackathon** by Mysten Labs.
 
