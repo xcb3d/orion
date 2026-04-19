@@ -47,12 +47,6 @@ Ngay cả khi mất quyền truy cập vào phương thức đăng nhập chính
 - **Frontend**: React, TypeScript, Vite, Tailwind CSS
 - **Documentation**: cmdocs (MDX)
 
----
-
-## 📖 Bắt Đầu
-
-Để tìm hiểu chi tiết về cách cài đặt và phát triển, vui lòng tham khảo tài liệu tại thư mục [`orion-docs`](./orion-docs) hoặc truy cập [Orion Developer Portal](https://docs.orion.com).
-
----
 
 Built with ❤️ for **CommandOSS Hackathon** by Mysten Labs.
+
