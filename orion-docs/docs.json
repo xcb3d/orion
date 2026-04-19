@@ -1,0 +1,87 @@
+{
+  "$schema": "https://dev.cmdocs.sh/schema/docs.json",
+  "name": "Orion Developer Portal",
+  "description": "Documentation for the Orion Password Manager — a zero-knowledge, decentralized credential manager built on Sui.",
+  "favicon": "/favicon.svg",
+  "theme": {
+    "preset": "neutral",
+    "colors": {
+      "primary": "#10B981"
+    },
+    "darkMode": true,
+    "breadcrumb": true,
+    "lastUpdated": true
+  },
+  "seo": {
+    "title": "Orion Developer Portal",
+    "titleTemplate": "%s — Orion",
+    "description": "Documentation for the Orion Password Manager — a zero-knowledge, decentralized credential manager built on Sui."
+  },
+  "navbar": {
+    "title": "Orion",
+    "logo": {
+      "light": "/logo/light-logo-only.svg",
+      "dark": "/logo/dark-logo-only.svg",
+      "display": "brand-name-and-logo"
+    },
+    "github": "https://github.com/orion-passman",
+    "links": []
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "label": "Architecture",
+        "path": "architecture",
+        "description": "System architecture, security model, and authentication flow",
+        "icon": "Box",
+        "groups": [
+          {
+            "label": "System Design",
+            "pages": [
+              { "file": "architecture/overview" },
+              { "file": "architecture/security-model" },
+              { "file": "architecture/authentication" }
+            ]
+          }
+        ]
+      },
+      {
+        "label": "Smart Contract",
+        "path": "contract",
+        "description": "Sui Move contracts, recovery system, and gas sponsorship",
+        "icon": "Code",
+        "groups": [
+          {
+            "label": "On-Chain",
+            "pages": [
+              { "file": "contract/overview" },
+              { "file": "contract/recovery-module" },
+              { "file": "contract/gas-station" }
+            ]
+          }
+        ]
+      },
+      {
+        "label": "Extension",
+        "path": "extension",
+        "description": "Browser extension architecture, crypto engine, and integrations",
+        "icon": "Puzzle",
+        "groups": [
+          {
+            "label": "Core",
+            "pages": [
+              { "file": "extension/overview" },
+              { "file": "extension/background" },
+              { "file": "extension/crypto-engine" },
+              { "file": "extension/walrus" }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "text": "Built with cmdocs",
+    "copyright": "© 2026 Orion — CommandOSS Hackathon by Mysten Labs"
+  }
+}

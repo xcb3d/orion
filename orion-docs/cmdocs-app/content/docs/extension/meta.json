@@ -1,0 +1,12 @@
+{
+  "title": "Extension",
+  "description": "Browser extension architecture, crypto engine, and integrations",
+  "root": true,
+  "pages": [
+    "---Core---",
+    "overview",
+    "background",
+    "crypto-engine",
+    "walrus"
+  ]
+}

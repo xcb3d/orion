@@ -1,0 +1,7 @@
+node_modules/
+out/
+.next/
+.cmdocs/node_modules/
+.cmdocs/out/
+.cmdocs/.next/
+.cmdocs/test.ts

@@ -1,0 +1,13 @@
+{
+  "name": "orion-gas-station",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Sponsored Transaction Service for Orion Password Manager",
+  "main": "sponsor-server.js",
+  "dependencies": {
+    "@mysten/sui": "^2.16.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^4.21.0"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "title": "Smart Contract",
+  "description": "Sui Move contracts, recovery system, and gas sponsorship",
+  "root": true,
+  "pages": [
+    "---On-Chain---",
+    "overview",
+    "recovery-module",
+    "gas-station"
+  ]
+}

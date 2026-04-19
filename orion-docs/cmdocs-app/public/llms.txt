@@ -1,0 +1,16 @@
+# Orion Developer Portal
+
+> Documentation for the Orion Password Manager — a zero-knowledge, decentralized credential manager built on Sui.
+
+## Docs
+
+- [Architecture Overview](/architecture/overview): High-level architecture of the Orion Password Manager ecosystem — a zero-knowledge, decentralized credential manager built on Sui.
+- [Security Model](/architecture/security-model): Threat model, cryptographic design, and defense-in-depth strategy for the Orion Password Manager.
+- [Authentication Flow](/architecture/authentication): Complete zkLogin authentication flow — from Google OAuth to Sui address derivation.
+- [Smart Contract Overview](/contract/overview): Sui Move smart contract for the Orion Password Manager — on-chain vault pointers with versioned rotation.
+- [Recovery Module](/contract/recovery-module): Emergency Kit recovery system — vault restoration when the Master PIN is forgotten.
+- [Gas Station](/contract/gas-station): Sponsored transaction relay — enabling gasless interactions for all Orion users.
+- [Extension Overview](/extension/overview): Orion Browser Extension — Manifest V3 architecture, component structure, and messaging system.
+- [Background Service Worker](/extension/background): The Orion Secrets Engine — message handling, vault sync, and blockchain interactions.
+- [Crypto Engine](/extension/crypto-engine): Deep dive into Orion's client-side cryptography — AES-256-GCM, Argon2id, DEK/KEK hierarchy.
+- [Walrus Integration](/extension/walrus): Decentralized storage integration — encrypted vault blob management on Walrus Protocol.

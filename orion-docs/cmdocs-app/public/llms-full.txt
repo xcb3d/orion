@@ -1,0 +1,1578 @@
+# Architecture Overview (/architecture/overview)
+
+# Architecture Overview
+
+Orion is a **zero-knowledge, decentralized password manager** that combines the security of client-side AES-256-GCM encryption with the permanence of on-chain storage on **Sui** and **Walrus**. Users authenticate via **zkLogin** (Google OAuth), eliminating the need for seed phrases or wallets.
+
+<Callout type="info">
+  Orion was designed and built for the **CommandOSS Hackathon** by Mysten Labs — leveraging 100% native Sui technologies.
+</Callout>
+
+## System Components
+
+The ecosystem consists of four deployable units:
+
+| Component | Technology | Purpose |
+|---|---|---|
+| **Extension** | React + TypeScript + Vite (Manifest V3) | User-facing browser extension with popup UI, content scripts, and background service worker |
+| **Smart Contract** | Sui Move | On-chain vault pointer (`EncryptedVaultKey`) with versioned rotation and event emission |
+| **Gas Station** | Node.js (Express) | Sponsored transaction relay — users never pay gas fees |
+| **Landing** | Vite + React | Marketing page and public documentation |
+
+## High-Level Data Flow
+
+```mermaid
+graph TD
+    subgraph Browser["Browser Extension (Manifest V3)"]
+        UI["Popup UI<br/>(React)"]
+        BG["Background<br/>Service Worker"]
+        CS["Content Script<br/>(Autofill)"]
+    end
+
+    subgraph Sui["Sui Blockchain"]
+        SC["EncryptedVaultKey<br/>(Move Object)"]
+    end
+
+    subgraph Walrus["Walrus Protocol"]
+        WS["Encrypted Vault<br/>Blob Storage"]
+    end
+
+    subgraph Enoki["Mysten Enoki"]
+        ZK["zkLogin Prover"]
+    end
+
+    subgraph GS["Gas Station"]
+        SP["Sponsor Server"]
+    end
+
+    UI -->|"Chrome Messaging"| BG
+    CS -->|"Chrome Messaging"| BG
+    BG -->|"PUT /v1/blobs"| WS
+    BG -->|"MoveCall: store_key / update_key"| SC
+    BG -->|"zkLogin Proof Request"| ZK
+    BG -->|"Sponsored TX"| SP
+    SP -->|"Execute TX"| SC
+```
+
+## Zero-Knowledge Encryption Model
+
+Orion follows a **two-layer key hierarchy** inspired by industry standards like 1Password and Bitwarden:
+
+```mermaid
+graph LR
+    MP["Master PIN<br/>(User Input)"] --> KDF["Argon2id<br/>(15 iterations, 64MB)"]
+    KDF --> KEK["KEK<br/>(Key Encryption Key)"]
+    KEK -->|"AES-256-GCM"| EDEK["Encrypted DEK"]
+    DEK["DEK<br/>(Random 256-bit)"] -->|"AES-256-GCM"| EV["Encrypted Vault"]
+    RC["Recovery Code"] --> KDF2["Argon2id"]
+    KDF2 --> RKEK["Recovery KEK"]
+    RKEK -->|"AES-256-GCM"| RDEK["Recovery DEK<br/>(same DEK, different wrapper)"]
+```
+
+1. **DEK (Data Encryption Key):** A random 256-bit key generated once per vault. It encrypts all credential data.
+2. **KEK (Key Encryption Key):** Derived from the user's Master PIN via Argon2id. It wraps (encrypts) the DEK.
+3. **Recovery KEK:** Derived from a one-time Recovery Code. It wraps the same DEK, providing an independent recovery path.
+
+<Callout type="warning">
+  The Master PIN and Recovery Code are **never stored** anywhere — not in the extension, not on the blockchain, not on Walrus. If both are lost, the vault is cryptographically irrecoverable.
+</Callout>
+
+## Vault Synchronization Pipeline
+
+Every CRUD operation (Add / Edit / Delete credential) triggers an **atomic, serialized sync pipeline**:
+
+<Steps>
+### Step 1: Local Mutation
+The credential is encrypted with the DEK and saved to Chrome's `session` storage (RAM-only).
+
+### Step 2: Encrypt & Package
+The full vault is re-encrypted with the DEK. The DEK itself is re-wrapped with the KEK. Both are bundled into a `WrappedVaultPayload`.
+
+### Step 3: Upload to Walrus
+The encrypted payload is uploaded as a binary blob to the Walrus Publisher endpoint, returning a `blobId`.
+
+### Step 4: Update On-Chain Pointer
+A `MoveCall` to `sui_seal::update_key` updates the `EncryptedVaultKey` object with the new `blobId`. This transaction is **sponsored** (zero gas for users) and signed with a **zkLogin signature**.
+
+### Step 5: Offline Cache
+The encrypted payload and latest `blobId` are cached in `chrome.storage.local` for instant offline recovery.
+</Steps>
+
+## Technology Stack
+
+| Layer | Technology | Why |
+|---|---|---|
+| **Authentication** | zkLogin (Enoki) | Web2-grade UX — sign in with Google, no seed phrases |
+| **Key Derivation** | Argon2id (hash-wasm) | Memory-hard KDF resistant to GPU/ASIC brute-force attacks |
+| **Encryption** | AES-256-GCM (Web Crypto API) | Authenticated encryption with associated data (AEAD) |
+| **Decentralized Storage** | Walrus Protocol | Content-addressed, immutable blob storage on Sui |
+| **On-Chain State** | Sui Move (EncryptedVaultKey) | Versioned pointer to the latest Walrus blob, owned by the user's zkLogin address |
+| **Gas Sponsorship** | Enoki Sponsored Transactions | Users never need SUI tokens to interact with the blockchain |
+| **Extension Runtime** | Chrome Manifest V3 | Service worker-based background, Shadow DOM content scripts |
+
+---
+
+# Security Model (/architecture/security-model)
+
+# Security Model
+
+Orion implements a **defense-in-depth** security architecture. Every layer — from user input to blockchain finality — is designed to ensure that **no single point of compromise** can expose plaintext credentials.
+
+## Threat Model
+
+| Threat | Mitigation |
+|---|---|
+| **Compromised local storage** | All data at rest is AES-256-GCM encrypted. The DEK is never stored in plaintext — only wrapped by the KEK (derived from the Master PIN). |
+| **Brute-force Master PIN** | Argon2id with 15 iterations and 64MB memory makes each guess take ~500ms, even on modern hardware. |
+| **Man-in-the-middle (Walrus)** | All data uploaded to Walrus is already encrypted client-side. Walrus only ever sees ciphertext. |
+| **Malicious content script injection** | The autofill UI uses **Shadow DOM** isolation. CSS/JS on the host page cannot read or tamper with Orion's injected UI. |
+| **Phishing via similar domains** | Domain matching uses **strict hostname comparison** — `evil-github.com` will never match credentials saved for `github.com`. |
+| **Session hijacking** | Sensitive session data (DEK, PIN, zkLogin JWT) is stored in `chrome.storage.session` (RAM-only) and auto-expires via a configurable timeout. |
+| **Replay attacks on-chain** | Each `EncryptedVaultKey` has a monotonically incrementing `version` field. Stale updates are detectable. |
+| **Race conditions during sync** | The background service worker uses a **serial queue** (`syncPromise` chaining) to prevent concurrent Walrus/Sui updates. |
+
+## Cryptographic Primitives
+
+### Key Derivation — Argon2id
+
+```typescript
+// From: src/lib/crypto.ts
+const hash = await argon2id({
+  password: cryptoSecret,
+  salt: salt,              // 16 bytes, cryptographically random
+  parallelism: 1,
+  iterations: 15,          // Hardened from default
+  memorySize: 65536,       // 64 MB — GPU/ASIC resistant
+  hashLength: 32,          // 256-bit output
+  outputType: 'binary',
+});
+```
+
+<Callout type="info">
+  Argon2id is the **winner of the Password Hashing Competition (PHC)** and is recommended by OWASP for password storage. It combines Argon2i's resistance to side-channel attacks with Argon2d's resistance to GPU cracking.
+</Callout>
+
+### Encryption — AES-256-GCM
+
+Every encryption operation generates:
+- A fresh **16-byte random salt** (for KDF-based encryption) or uses a raw key (for DEK-based encryption)
+- A fresh **12-byte random IV** (initialization vector)
+- A **ciphertext** with integrated authentication tag (GCM mode)
+
+```typescript
+interface SealedPackage {
+  ciphertext: string; // Base64-encoded AES-GCM output
+  iv: string;         // Base64-encoded 12-byte IV
+  salt: string;       // Base64-encoded 16-byte salt
+}
+```
+
+### Vault Payload Structure
+
+The complete encrypted payload stored on Walrus:
+
+```typescript
+interface WrappedVaultPayload {
+  encryptedDEK: SealedPackage;   // DEK encrypted with KEK (Master PIN)
+  recoveryDEK?: SealedPackage;   // DEK encrypted with Recovery KEK
+  vaultPackage: SealedPackage;   // Vault data encrypted with DEK
+}
+```
+
+## Session Security
+
+Orion uses Chrome's **session storage** (`chrome.storage.session`) which exists only in RAM and is automatically cleared when the browser closes.
+
+### Stored in Session (RAM-only)
+| Key | Purpose | Auto-cleared? |
+|---|---|---|
+| `pin` | Master PIN hash | ✅ On timeout or browser close |
+| `cryptoSecret` | Derived KEK material | ✅ On timeout or browser close |
+| `dek` | Data Encryption Key | ✅ On timeout or browser close |
+| `vault` | Decrypted vault entries | ✅ On timeout or browser close |
+| `jwt` | Google OAuth JWT | ✅ On timeout or browser close |
+
+### Stored in Local Storage (Encrypted)
+| Key | Purpose | Encryption |
+|---|---|---|
+| `encrypted_vault` | Offline vault cache | AES-256-GCM (DEK) |
+| `encrypted_zk_credentials` | JWT + zkState + zkProof | AES-256-GCM (KEK) |
+| `orion_seal_object_id` | Sui object reference | None (non-sensitive) |
+| `orion_sui_address` | User's zkLogin address | None (public data) |
+
+### Auto-Lock Timeout
+
+Users can configure session timeout from the extension settings:
+
+| Option | Duration | Use Case |
+|---|---|---|
+| Maximum Security | 1 minute | Public/shared computers |
+| Balanced | 15 minutes | Default — recommended |
+| Standard | 1 hour | Personal workstations |
+| Never | ∞ | Trusted devices only |
+
+The background service worker runs a 10-second polling interval to check and enforce session expiry.
+
+## Domain Matching (Anti-Phishing)
+
+The autofill engine uses **strict hostname matching** to prevent phishing attacks:
+
+```typescript
+// From: src/extension/background.ts
+const searchDomain = domain.toLowerCase().replace(/^www\./, '');
+const urlObj = new URL(entryUrl.startsWith('http') ? entryUrl : `https://${entryUrl}`);
+const entryDomain = urlObj.hostname.replace(/^www\./, '');
+
+// Must match exactly or be a subdomain
+return entryDomain === searchDomain
+    || entryDomain.endsWith(`.${searchDomain}`);
+```
+
+This means:
+- ✅ `github.com` matches credentials saved for `github.com`
+- ✅ `gist.github.com` matches credentials saved for `github.com` (subdomain)
+- ❌ `evil-github.com` does **NOT** match
+- ❌ `github.com.evil.com` does **NOT** match
+
+## Sync Concurrency Control
+
+To prevent **race conditions** when multiple CRUD operations fire in rapid succession, the background service worker implements a **serial queue**:
+
+```typescript
+// From: src/extension/background.ts
+let syncPromise: Promise<any> = Promise.resolve();
+
+async function executeSyncVault(payload: any) {
+  syncPromise = syncPromise.then(async () => {
+    // ... encrypt → upload to Walrus → update Sui ...
+  });
+  return syncPromise;
+}
+```
+
+This guarantees that each sync operation completes fully (Walrus upload + Sui update) before the next one begins, preventing data loss or version conflicts on-chain.
+
+## Recovery System
+
+The **Emergency Kit** recovery system provides a safe escape hatch when the Master PIN is forgotten:
+
+<Steps>
+### Step 1: Generate Recovery Code
+During vault initialization, a one-time Recovery Code is generated. The DEK is encrypted with both the Master KEK and the Recovery KEK.
+
+### Step 2: Store Both Wrappers
+Both `encryptedDEK` (KEK-wrapped) and `recoveryDEK` (Recovery KEK-wrapped) are stored together in the Walrus blob.
+
+### Step 3: Recovery Flow
+The user provides the Recovery Code. The system fetches the latest `EncryptedVaultKey` from Sui, downloads the blob from Walrus, decrypts the DEK using the Recovery KEK, and re-wraps it with a new Master KEK.
+</Steps>
+
+<Callout type="warning">
+  The Recovery Code is shown **once** during initialization. It is never stored by Orion. Users must save it offline (printed paper, hardware vault, etc.).
+</Callout>
+
+---
+
+# Authentication Flow (/architecture/authentication)
+
+# Authentication Flow
+
+Orion uses **Sui zkLogin** (via Mysten's Enoki service) to provide a seamless Web2 login experience. Users sign in with their Google account and receive a deterministic Sui address — no wallets, no seed phrases.
+
+## Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant EXT as Extension UI
+    participant BG as Background Worker
+    participant G as Google OAuth
+    participant E as Enoki API
+    participant SUI as Sui Blockchain
+
+    U->>EXT: Click "Sign in with Google"
+    EXT->>BG: START_LOGIN message
+    BG->>BG: Generate Ephemeral Keypair
+    BG->>BG: Generate Randomness + Nonce
+    BG->>SUI: Get Current Epoch
+    BG->>BG: maxEpoch = epoch + 30
+    BG->>BG: Save zkState to session
+    BG->>G: Launch OAuth Flow (chrome.identity)
+    G-->>U: Google Login Prompt
+    U->>G: Approve
+    G-->>BG: JWT (id_token)
+    BG->>E: GET /zklogin (derive address)
+    E-->>BG: Sui Address
+    BG->>SUI: Check EncryptedVaultKey exists
+    SUI-->>BG: true/false
+    BG->>BG: Save email, address, hasVault
+    BG-->>EXT: { success, email, address }
+```
+
+## Technical Details
+
+### 1. Ephemeral Keypair Generation
+
+Each login session generates a fresh Ed25519 keypair that is valid for `maxEpoch` (current epoch + 30 ≈ 30 days):
+
+```typescript
+const ephemeralKeyPair = new Ed25519Keypair();
+const randomness = generateRandomness();
+const maxEpoch = currentEpoch + 30;
+const nonce = generateNonce(
+  ephemeralKeyPair.getPublicKey(),
+  maxEpoch,
+  randomness
+);
+```
+
+### 2. Google OAuth via Chrome Identity API
+
+The background worker uses `chrome.identity.launchWebAuthFlow()` for a native OAuth experience:
+
+```typescript
+chrome.identity.launchWebAuthFlow(
+  { url: authUrl, interactive: true },
+  async (redirectUrl) => {
+    const url = new URL(redirectUrl.replace('#', '?'));
+    const jwt = url.searchParams.get('id_token');
+    // ...
+  }
+);
+```
+
+### 3. Sui Address Derivation (Enoki)
+
+The JWT is sent to Enoki to deterministically derive a Sui address:
+
+```typescript
+const response = await fetch(`${ENOKI_ENDPOINT}/zklogin`, {
+  method: 'GET',
+  headers: {
+    'Authorization': `Bearer ${ENOKI_API_KEY}`,
+    'zklogin-jwt': jwt
+  }
+});
+const { data } = await response.json();
+// data.address → "0x..."
+```
+
+<Callout type="info">
+  The same Google account always produces the **same Sui address** — this is deterministic and managed by Enoki's salt service.
+</Callout>
+
+### 4. zkProof Generation
+
+When the user initializes or unlocks their vault, a zero-knowledge proof is generated:
+
+```typescript
+const zkProof = await getZkProof(jwt, {
+  maxEpoch: zkState.maxEpoch,
+  randomness: zkState.randomness,
+  ephemeralPublicKey: zkState.ephemeralPublicKey
+});
+```
+
+This proof allows blockchain transactions to be signed without revealing the user's Google identity on-chain.
+
+### 5. Credential Persistence
+
+To avoid re-authenticating with Google on every browser restart, the JWT, zkState, and zkProof are encrypted with the user's KEK and stored locally:
+
+```typescript
+const sealedCreds = await CredentialManager.encryptCredentials(
+  jwt, zkState, zkProof, cryptoSecret
+);
+await chrome.storage.local.set({
+  [LocalStorageKey.ENCRYPTED_ZK_CREDENTIALS]: sealedCreds
+});
+```
+
+On unlock, these credentials are decrypted with the Master PIN, restoring the full session without any network calls to Google or Enoki.
+
+## Post-Login States
+
+After successful login, the extension determines the user's vault state:
+
+| State | Condition | Next Screen |
+|---|---|---|
+| **New User** | No `EncryptedVaultKey` on-chain | Create Vault (set Master PIN + Recovery Code) |
+| **Returning User** | `EncryptedVaultKey` exists | Unlock Vault (enter Master PIN) |
+
+---
+
+# Smart Contract Overview (/contract/overview)
+
+# Smart Contract
+
+The Orion smart contract is written in **Sui Move** and deployed on **Sui Testnet**. It serves as the **trust anchor** of the entire system — a tamper-proof, user-owned pointer to the latest encrypted vault blob on Walrus.
+
+<Callout type="info">
+  **Package ID:** `0xfd5ea9c62a35a86eaa0d4afb74d7b4d0e9547084335a19a660d592c0992a292b`  
+  **Module:** `sui_seal`  
+  **Network:** Sui Testnet
+</Callout>
+
+## Why On-Chain?
+
+Unlike centralized password managers (LastPass, Chrome Passwords), Orion's on-chain pointer guarantees:
+
+1. **User Ownership:** The `EncryptedVaultKey` is an owned object — only the user's zkLogin address can modify it.
+2. **Immutable Audit Trail:** Every rotation emits an event, creating a permanent history on the Sui blockchain.
+3. **Censorship Resistance:** No centralized party can lock the user out of their vault pointer.
+4. **Cross-Device Discovery:** Any device can discover the user's vault by querying their Sui address.
+
+## Contract Structure
+
+The contract consists of a single module with two core functions:
+
+```
+liquify-contract/
+├── Move.toml
+├── Published.toml
+└── sources/
+    └── sui_seal.move       # Vault pointer management
+```
+
+## Data Model
+
+### EncryptedVaultKey
+
+The primary on-chain object — acts as a pointer to the encrypted vault on Walrus:
+
+```move
+public struct EncryptedVaultKey has key {
+    id: UID,
+    /// Reference to the encrypted vault on Walrus (binary safe)
+    walrus_blob_id: vector<u8>,
+    /// Monotonically incrementing version counter
+    version: u64,
+    /// Epoch when the seal was first created
+    created_at: u64,
+}
+```
+
+| Field | Type | Purpose |
+|---|---|---|
+| `id` | `UID` | Unique Sui object identifier |
+| `walrus_blob_id` | `vector<u8>` | UTF-8 encoded Walrus blob ID (content-addressed hash) |
+| `version` | `u64` | Monotonically incrementing counter, starts at 1 |
+| `created_at` | `u64` | The Sui epoch when the vault was first created |
+
+<Callout type="warning">
+  The `walrus_blob_id` stores the **reference** to encrypted data, not the data itself. The actual encrypted vault lives on Walrus. Even if someone reads this on-chain, they only get an opaque blob ID — the content is AES-256-GCM encrypted and cryptographically useless without the user's Master PIN.
+</Callout>
+
+### Events
+
+Two events provide a full audit trail:
+
+```move
+/// Emitted when a new vault is created
+public struct KeyStoredEvent has copy, drop {
+    key_id: ID,
+    owner: address,
+}
+
+/// Emitted when the vault pointer is rotated
+public struct KeyRotatedEvent has copy, drop {
+    key_id: ID,
+    owner: address,
+    version: u64,
+}
+```
+
+## Core Functions
+
+### `store_key` — Create a New Vault Pointer
+
+Called once per user during vault initialization. Creates a new `EncryptedVaultKey` and transfers it to the sender.
+
+```move
+public fun store_key(
+    walrus_blob_id: vector<u8>,
+    ctx: &mut TxContext
+) {
+    assert!(vector::length(&walrus_blob_id) > 0, EInvalidBlobId);
+
+    let id = object::new(ctx);
+    let key_id = object::uid_to_inner(&id);
+    let sender = tx_context::sender(ctx);
+
+    let vault_key = EncryptedVaultKey {
+        id,
+        walrus_blob_id,
+        version: 1,
+        created_at: tx_context::epoch(ctx),
+    };
+
+    event::emit(KeyStoredEvent { key_id, owner: sender });
+    transfer::transfer(vault_key, sender);
+}
+```
+
+**Security properties:**
+- ✅ Validates `walrus_blob_id` is non-empty
+- ✅ Object is transferred to `tx_context::sender` (the user's zkLogin address)
+- ✅ Emits `KeyStoredEvent` for indexing and audit
+
+### `update_key` — Rotate the Vault Pointer
+
+Called on every sync operation. Updates the `walrus_blob_id` to point to the latest encrypted blob.
+
+```move
+public fun update_key(
+    vault_key: &mut EncryptedVaultKey,
+    new_walrus_blob_id: vector<u8>,
+    ctx: &mut TxContext
+) {
+    assert!(vector::length(&new_walrus_blob_id) > 0, EInvalidBlobId);
+
+    vault_key.walrus_blob_id = new_walrus_blob_id;
+
+    let old_version = vault_key.version;
+    vault_key.version = old_version + 1;
+
+    event::emit(KeyRotatedEvent {
+        key_id: object::id(vault_key),
+        owner: tx_context::sender(ctx),
+        version: vault_key.version,
+    });
+}
+```
+
+**Security properties:**
+- ✅ Requires `&mut EncryptedVaultKey` — only the **owner** can provide this reference (enforced by Sui's object model)
+- ✅ Version is **monotonically incremented** — prevents rollback attacks
+- ✅ Emits `KeyRotatedEvent` with the new version number
+
+## Object Discovery
+
+The extension discovers the user's vault by querying owned objects filtered by struct type:
+
+```typescript
+// From: src/lib/sui-parser.ts
+const objects = await client.getOwnedObjects({
+  owner: suiAddress,
+  filter: {
+    StructType: `${PACKAGE_ID}::sui_seal::EncryptedVaultKey`
+  },
+  options: { showContent: true }
+});
+```
+
+If multiple `EncryptedVaultKey` objects exist (edge case from failed past operations), the parser selects the one with the **highest version number**.
+
+## Transaction Execution
+
+All on-chain transactions use **zkLogin + Sponsored Transactions**:
+
+```mermaid
+sequenceDiagram
+    participant EXT as Extension
+    participant GS as Gas Station
+    participant SUI as Sui Network
+
+    EXT->>EXT: Build Transaction (MoveCall)
+    EXT->>GS: POST /sponsor (txBytes + sender)
+    GS->>GS: Enoki createSponsoredTransaction
+    GS-->>EXT: sponsoredTxBytes + digest
+    EXT->>EXT: Sign with Ephemeral Key
+    EXT->>EXT: Assemble zkLogin Signature
+    EXT->>GS: POST /execute (digest + signature)
+    GS->>SUI: Submit Transaction
+    SUI-->>GS: Transaction Result
+    GS-->>EXT: { digest }
+```
+
+<Callout type="info">
+  Users **never need SUI tokens**. All gas fees are covered by the project's Gas Station via Enoki's Sponsored Transaction API.
+</Callout>
+
+---
+
+# Recovery Module (/contract/recovery-module)
+
+# Recovery Module
+
+The Recovery Module provides a **decentralized escape hatch** for users who lose their Master PIN. Unlike centralized password managers where a company can reset your account, Orion's recovery is entirely **self-sovereign** — only the user holding the Recovery Code can restore access.
+
+## How It Works
+
+```mermaid
+graph TD
+    subgraph Init["Vault Initialization"]
+        A["Generate DEK<br/>(Random 256-bit)"] --> B["Encrypt DEK<br/>with Master KEK"]
+        A --> C["Encrypt DEK<br/>with Recovery KEK"]
+        B --> D["encryptedDEK"]
+        C --> E["recoveryDEK"]
+        D --> F["Upload to Walrus<br/>(WrappedVaultPayload)"]
+        E --> F
+    end
+
+    subgraph Recovery["Recovery Flow"]
+        G["User enters<br/>Recovery Code"] --> H["Derive Recovery KEK<br/>(Argon2id)"]
+        H --> I["Decrypt recoveryDEK<br/>→ get DEK"]
+        I --> J["Re-encrypt DEK<br/>with new Master KEK"]
+        J --> K["Sync to Walrus + Sui"]
+    end
+```
+
+## Data Structure
+
+The `WrappedVaultPayload` stored on Walrus always contains both key wrappers:
+
+```typescript
+interface WrappedVaultPayload {
+  encryptedDEK: SealedPackage;     // DEK → KEK (Master PIN)
+  recoveryDEK?: SealedPackage;     // DEK → Recovery KEK
+  vaultPackage: SealedPackage;     // Vault → DEK
+}
+```
+
+## Recovery Flow (Step by Step)
+
+<Steps>
+
+### Step 1: Fetch Vault Pointer from Sui
+
+The system queries the Sui blockchain directly to find the user's latest `EncryptedVaultKey`, regardless of local storage state:
+
+```typescript
+const sealClient = new SuiSealClient();
+const pointer = await sealClient.getLatestSeal(suiAddress);
+// pointer.objectId → "0x..."
+// pointer.walrusBlobId → "abc123..."
+```
+
+### Step 2: Download Encrypted Payload from Walrus
+
+```typescript
+const storage = new WalrusAdapter();
+const wrapped = await storage.readWrappedPayload(pointer.walrusBlobId);
+```
+
+### Step 3: Decrypt DEK with Recovery Code
+
+The Recovery Code is used to derive a Recovery KEK, which decrypts the `recoveryDEK` field:
+
+```typescript
+const recoveryCryptoSecret = await sha256(recoveryCode + suiAddress);
+const dek = await CryptoEngine.decrypt(
+  wrapped.recoveryDEK,
+  recoveryCryptoSecret
+);
+```
+
+<Callout type="warning">
+  If the Recovery Code is incorrect, `CryptoEngine.decrypt` will throw an `OperationError` (AES-GCM authentication failure). The system catches this and returns `"Incorrect Recovery Code"`.
+</Callout>
+
+### Step 4: Re-encrypt with New Master PIN
+
+The recovered DEK is re-wrapped with a new Master KEK derived from the user's new Master PIN:
+
+```typescript
+// Set new session with recovered DEK
+await SessionManager.setSession(newPin, 30, newCryptoSecret, dek);
+
+// Trigger sync (re-encrypts DEK with new KEK, uploads to Walrus)
+await executeSyncVault({
+  jwt, zkState, zkProof,
+  objectId: pointer.objectId,
+  sponsorUrl
+});
+```
+
+### Step 5: Update Local Credentials
+
+The encrypted zkLogin credentials are also re-encrypted with the new KEK:
+
+```typescript
+const sealedCreds = await CredentialManager.encryptCredentials(
+  jwt, zkState, zkProof, newCryptoSecret
+);
+await chrome.storage.local.set({
+  [LocalStorageKey.ENCRYPTED_ZK_CREDENTIALS]: sealedCreds,
+  [LocalStorageKey.ORION_SEAL_OBJECT_ID]: pointer.objectId
+});
+```
+
+</Steps>
+
+## Recovery Code Generation
+
+The Recovery Code is generated during **vault initialization only**. It is a user-provided string (minimum 8 characters) that is:
+
+1. Combined with the user's Sui address: `sha256(recoveryCode + suiAddress)`
+2. Used as input to Argon2id to derive a Recovery KEK
+3. Used to encrypt the DEK into the `recoveryDEK` field
+
+```typescript
+const recoveryCryptoSecret = await sha256(recoveryCode + suiAddress);
+const recoveryDEK = await CryptoEngine.encrypt(dek, recoveryCryptoSecret);
+```
+
+<Callout type="info">
+  The Recovery Code is **address-bound** — the same code used with a different Google account produces a completely different KEK, making it useless for cross-account attacks.
+</Callout>
+
+## Backward Compatibility
+
+Vaults created before the Recovery feature was added will not have a `recoveryDEK` field. The system handles this gracefully:
+
+```typescript
+if (!wrapped.recoveryDEK) {
+  return {
+    error: 'This vault does not support Recovery Codes.'
+  };
+}
+```
+
+## Recovery Code Preservation During Sync
+
+When the vault is synced (after any CRUD operation), the system **preserves the existing `recoveryDEK`** from the previous payload:
+
+```typescript
+// From background.ts — executeSyncVault
+let recoveryDEK = undefined;
+try {
+  const oldWrapped = await StorageManager.getEncryptedVault();
+  if (oldWrapped?.recoveryDEK) {
+    recoveryDEK = oldWrapped.recoveryDEK;
+  }
+} catch (e) {
+  console.warn('Failed to read old recoveryDEK');
+}
+
+const wrappedPayload = {
+  encryptedDEK,
+  vaultPackage,
+  ...(recoveryDEK ? { recoveryDEK } : {})
+};
+```
+
+This ensures the Recovery Code remains valid across all sync operations without requiring the user to re-enter it.
+
+---
+
+# Gas Station (/contract/gas-station)
+
+# Gas Station
+
+The Orion Gas Station is a lightweight Node.js server that **sponsors all blockchain transactions** for Orion users. This means users never need to hold SUI tokens — the project covers all gas fees via Mysten's Enoki Sponsored Transaction API.
+
+## Why Sponsored Transactions?
+
+For a password manager to achieve mainstream adoption, users cannot be expected to:
+- Understand gas fees
+- Acquire SUI tokens from an exchange
+- Manage a separate crypto wallet
+
+Sponsored transactions eliminate this friction entirely.
+
+## Architecture
+
+```mermaid
+sequenceDiagram
+    participant EXT as Extension
+    participant GS as Gas Station Server
+    participant ENOKI as Enoki API
+    participant SUI as Sui Network
+
+    EXT->>EXT: Build TransactionKind
+    EXT->>GS: POST /sponsor<br/>{txBytes, sender, jwt}
+    GS->>ENOKI: createSponsoredTransaction
+    ENOKI-->>GS: sponsoredTxBytes + digest
+    GS-->>EXT: {sponsoredTxBytes, digest}
+    EXT->>EXT: Sign with Ephemeral Key
+    EXT->>EXT: Assemble zkLogin Signature
+    EXT->>GS: POST /execute<br/>{digest, signature}
+    GS->>ENOKI: executeSponsoredTransaction
+    ENOKI->>SUI: Submit Transaction
+    SUI-->>ENOKI: Result
+    ENOKI-->>GS: Transaction Result
+    GS-->>EXT: {digest}
+```
+
+## API Endpoints
+
+### `POST /sponsor`
+
+Creates a sponsored transaction.
+
+**Request:**
+```json
+{
+  "txBytes": "<base64-encoded TransactionKind>",
+  "sender": "0x...",
+  "jwt": "<google-oauth-jwt>"
+}
+```
+
+**Response:**
+```json
+{
+  "sponsoredTxBytes": "<base64>",
+  "digest": "<transaction-digest>"
+}
+```
+
+### `POST /execute`
+
+Executes a previously sponsored transaction with the user's zkLogin signature.
+
+**Request:**
+```json
+{
+  "digest": "<transaction-digest>",
+  "signature": "<zklogin-signature>"
+}
+```
+
+**Response:**
+```json
+{
+  "digest": "<final-transaction-digest>"
+}
+```
+
+## Extension Integration
+
+The `SuiExecutor` class handles the client-side assembly:
+
+```typescript
+// 1. Build TransactionKind (commands only)
+const txBytes = await tx.build({
+  client: this.client,
+  onlyTransactionKind: true,
+});
+
+// 2. Request Sponsorship
+const sponsorResponse = await fetch(sponsorUrl, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    txBytes: btoa(String.fromCharCode(...txBytes)),
+    sender: sender,
+    jwt: jwt,
+  }),
+});
+
+// 3. Sign with Ephemeral Key
+const { sponsoredTxBytes } = await sponsorResponse.json();
+const finalTxBytes = base64ToBytes(sponsoredTxBytes);
+const { signature } = await ephemeralKeyPair.signTransaction(finalTxBytes);
+
+// 4. Assemble zkLogin Signature
+const zkLoginSignature = getZkLoginSignature({
+  inputs: zkProof,
+  maxEpoch: Number(maxEpoch),
+  userSignature: signature,
+});
+
+// 5. Execute
+const executeResponse = await fetch(executeUrl, {
+  method: 'POST',
+  body: JSON.stringify({ digest, signature: zkLoginSignature }),
+});
+```
+
+<Callout type="info">
+  The Gas Station server is configured to run on `http://localhost:3001`. For production deployment, it should be placed behind HTTPS with rate limiting.
+</Callout>
+
+---
+
+# Extension Overview (/extension/overview)
+
+# Extension Overview
+
+The Orion Extension is a **Chrome Manifest V3** browser extension built with React, TypeScript, and Vite. It is the primary user interface for managing the encrypted vault.
+
+## Project Structure
+
+```
+orion-extension/
+├── src/
+│   ├── main.tsx                    # Entry point
+│   ├── App.tsx                     # Root component + state machine
+│   ├── config.ts                   # Centralized configuration
+│   ├── components/
+│   │   ├── LoginView.tsx           # Google OAuth login screen
+│   │   ├── PinEntryView.tsx        # Create / Unlock / Recover vault
+│   │   ├── Dashboard.tsx           # Credential list + search
+│   │   ├── Header.tsx              # Sync status, settings, logout
+│   │   ├── AddCredentialForm.tsx   # New credential form
+│   │   ├── EditCredentialForm.tsx  # Edit credential form
+│   │   ├── CredentialDetailView.tsx# Password reveal + autofill
+│   │   └── ChangePasswordModal.tsx # Master PIN change flow
+│   ├── extension/
+│   │   ├── background.ts          # Service worker (Secrets Engine)
+│   │   ├── content.ts             # Autofill injection (Shadow DOM)
+│   │   ├── messaging.ts           # Type-safe message dispatch
+│   │   ├── session.ts             # Session lifecycle manager
+│   │   ├── storage.ts             # Local storage abstraction
+│   │   └── constants.ts           # Centralized storage key enums
+│   ├── hooks/
+│   │   ├── useOrionEngine.ts      # Initialize / Unlock / Recover
+│   │   ├── useVault.ts            # CRUD + sync orchestration
+│   │   ├── useAuth.ts             # Google login state
+│   │   ├── useSession.ts          # Session polling
+│   │   └── useSessionTimeout.ts   # Auto-lock timer
+│   └── lib/
+│       ├── crypto.ts              # AES-256-GCM + Argon2id engine
+│       ├── seal.ts                # SuiSealClient orchestrator
+│       ├── sui-executor.ts        # zkLogin TX signing + execution
+│       ├── sui-parser.ts          # On-chain object discovery
+│       ├── walrus.ts              # Walrus blob read/write
+│       ├── walrus-adapter.ts      # High-level Walrus operations
+│       ├── zklogin.ts             # OAuth + Enoki integration
+│       ├── security.ts            # Credential encryption manager
+│       ├── vault.ts               # Vault type definitions
+│       └── utils.ts               # Polling utility
+```
+
+## Architecture Layers
+
+```mermaid
+graph TB
+    subgraph UI["UI Layer (React Components)"]
+        App --> LoginView
+        App --> PinEntry["PinEntryView"]
+        App --> Dashboard
+        Dashboard --> AddForm["AddCredentialForm"]
+        Dashboard --> Detail["CredentialDetailView"]
+        Dashboard --> EditForm["EditCredentialForm"]
+    end
+
+    subgraph Hooks["Hook Layer (Business Logic)"]
+        useAuth
+        useOrionEngine
+        useVault
+        useSession["useSession + useSessionTimeout"]
+    end
+
+    subgraph Extension["Extension Layer (Chrome APIs)"]
+        BG["background.ts<br/>(Service Worker)"]
+        Content["content.ts<br/>(Autofill)"]
+        Messaging["messaging.ts<br/>(Dispatcher)"]
+        Session["session.ts"]
+        Storage["storage.ts"]
+    end
+
+    subgraph Lib["Library Layer (Core Logic)"]
+        Crypto["crypto.ts"]
+        Seal["seal.ts"]
+        Executor["sui-executor.ts"]
+        Parser["sui-parser.ts"]
+        Walrus["walrus.ts"]
+        ZkLogin["zklogin.ts"]
+        Security["security.ts"]
+    end
+
+    UI --> Hooks
+    Hooks -->|"chrome.runtime.sendMessage"| Extension
+    Extension --> Lib
+```
+
+## Messaging System
+
+All communication between the popup UI and the background service worker uses a **typed message dispatch system**:
+
+```typescript
+// Type-safe message types
+const MessageType = {
+  SET_SESSION: 'SET_SESSION',
+  GET_SESSION: 'GET_SESSION',
+  EXTEND_SESSION: 'EXTEND_SESSION',
+  CLEAR_SESSION: 'CLEAR_SESSION',
+  GET_VAULT: 'GET_VAULT',
+  SAVE_SECRET: 'SAVE_SECRET',
+  DELETE_SECRET: 'DELETE_SECRET',
+  UPDATE_SECRET: 'UPDATE_SECRET',
+  SYNC_VAULT: 'SYNC_VAULT',
+  AUTOFILL_REQUEST: 'AUTOFILL_REQUEST',
+  FILL_FIELDS: 'FILL_FIELDS',
+  GET_DECRYPTED: 'GET_DECRYPTED',
+  GET_DOMAINS_CREDENTIALS: 'GET_DOMAINS_CREDENTIALS',
+  INLINE_FILL_REQUEST: 'INLINE_FILL_REQUEST',
+  START_LOGIN: 'START_LOGIN',
+  CHANGE_MASTER_PASSWORD: 'CHANGE_MASTER_PASSWORD',
+  RECOVER_MASTER_PASSWORD: 'RECOVER_MASTER_PASSWORD',
+} as const;
+```
+
+The `MessageDispatcher` class in the background worker provides a **chainable registration API**:
+
+```typescript
+const dispatcher = new MessageDispatcher();
+
+dispatcher
+  .register(MessageType.SET_SESSION, (payload) => ...)
+  .register(MessageType.GET_VAULT, () => ...)
+  .register(MessageType.SYNC_VAULT, executeSyncVault)
+  .listen();
+```
+
+## Application State Machine
+
+The `App.tsx` component manages the top-level application state:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Loading
+    Loading --> LoggedOut: No session
+    Loading --> NeedsSetup: Logged in, no vault
+    Loading --> Locked: Logged in, has vault, no PIN
+    Loading --> Unlocked: Logged in, has vault, has PIN
+    LoggedOut --> Loading: Google OAuth success
+    NeedsSetup --> Unlocked: Create Vault success
+    Locked --> Unlocked: Unlock success
+    Unlocked --> Locked: Session timeout
+    Unlocked --> LoggedOut: Logout
+```
+
+## Content Script (Autofill Engine)
+
+The `content.ts` module is injected into all web pages and provides:
+
+1. **Field Detection:** Scans for `input[type="password"]` and adjacent username fields
+2. **Domain Matching:** Queries the background for credentials matching the current hostname
+3. **Shadow DOM UI:** Injects a premium autofill bar below the password field, completely isolated from the host page's CSS
+
+The autofill bar features:
+- Emerald-and-black signature glass theme
+- Animated dropdown with avatar initials
+- One-click fill with success animation feedback
+- Multiple account support
+
+```mermaid
+sequenceDiagram
+    participant CS as Content Script
+    participant BG as Background Worker
+
+    CS->>CS: Detect password field
+    CS->>BG: GET_DOMAINS_CREDENTIALS (hostname)
+    BG-->>CS: [{ id, name, username }]
+    CS->>CS: Inject Shadow DOM bar
+    Note over CS: User clicks credential
+    CS->>BG: INLINE_FILL_REQUEST ({ id })
+    BG->>BG: Decrypt password with DEK
+    BG-->>CS: { username, password }
+    CS->>CS: Fill fields + trigger events
+```
+
+## Configuration
+
+All configuration is centralized in `config.ts`:
+
+```typescript
+const TESTNET_CONFIG: OrionConfig = {
+  network: 'testnet',
+  sui: {
+    packageId: '0xfd5ea9c...292b',
+    moduleName: 'sui_seal',
+  },
+  zkLogin: {
+    googleClientId: '690944...com',
+    enokiApiKey: 'enoki_public_...',
+    enokiEndpoint: 'https://api.enoki.mystenlabs.com/v1',
+  },
+  walrus: {
+    publisher: 'https://publisher.walrus-testnet.walrus.space',
+    aggregator: 'https://aggregator.walrus-testnet.walrus.space',
+  },
+  gas: {
+    sponsorUrl: 'http://localhost:3001/sponsor',
+  },
+  security: {
+    defaultTimeoutMinutes: 15,
+    timeoutOptions: [
+      { label: '1 minute', value: 1, desc: 'Highest security' },
+      { label: '15 minutes', value: 15, desc: 'Balanced' },
+      { label: '1 hour', value: 60, desc: 'Standard' },
+      { label: 'Never', value: 0, desc: 'Always unlocked' },
+    ]
+  },
+};
+```
+
+---
+
+# Background Service Worker (/extension/background)
+
+# Background Service Worker
+
+The `background.ts` module is the **Secrets Engine** of Orion. It runs as a Manifest V3 service worker and acts as the single source of truth for all sensitive operations.
+
+## Responsibilities
+
+| Domain | Operations |
+|---|---|
+| **Session** | Set, get, extend, clear session (PIN + KEK + DEK) |
+| **Vault CRUD** | Save, update, delete encrypted credentials |
+| **Sync** | Encrypt vault → Upload to Walrus → Update Sui pointer |
+| **Autofill** | Decrypt credentials and send to content scripts |
+| **Auth** | Orchestrate Google OAuth + zkLogin flow |
+| **Recovery** | Master PIN change and Emergency Kit recovery |
+
+## Serial Sync Queue
+
+The most critical architectural decision in the background worker is the **serial sync queue**:
+
+```typescript
+let syncPromise: Promise<any> = Promise.resolve();
+
+async function executeSyncVault(payload: any) {
+  syncPromise = syncPromise.then(async () => {
+    // 1. Encrypt vault with DEK
+    // 2. Re-wrap DEK with KEK
+    // 3. Upload to Walrus
+    // 4. Update Sui EncryptedVaultKey
+    // 5. Update local cache
+  });
+  return syncPromise;
+}
+```
+
+This prevents **race conditions** when users rapidly add/edit/delete credentials. Without this queue, concurrent Walrus uploads could result in the Sui pointer referencing a stale blob.
+
+## Sync Pipeline Detail
+
+```mermaid
+flowchart TD
+    A["SYNC_VAULT Message"] --> B{"Session Active?"}
+    B -->|No| ERR["Return Error"]
+    B -->|Yes| C["Get DEK from Session"]
+    C --> D["Encrypt vault with DEK"]
+    D --> E["Re-wrap DEK with KEK"]
+    E --> F["Preserve recoveryDEK"]
+    F --> G["Bundle WrappedVaultPayload"]
+    G --> H["PUT to Walrus Publisher"]
+    H --> I{"zkProof available?"}
+    I -->|No| SKIP["Skip chain update"]
+    I -->|Yes| J["MoveCall: update_key"]
+    J --> K["Save to local cache"]
+    SKIP --> K
+    K --> L["Set SYNC_STATUS = IDLE"]
+```
+
+## Message Handlers
+
+### Session Management
+
+| Message | Handler | Description |
+|---|---|---|
+| `SET_SESSION` | `SessionManager.setSession(pin, timeout, cryptoSecret)` | Creates a new vault session |
+| `GET_SESSION` | `SessionManager.getSession()` | Returns current session or null |
+| `EXTEND_SESSION` | `SessionManager.extendSession(timeout)` | Extends session expiry |
+| `CLEAR_SESSION` | `SessionManager.clearSession()` | Wipes all session data from RAM |
+
+### Vault Operations
+
+| Message | Handler | Description |
+|---|---|---|
+| `GET_VAULT` | `SessionManager.getVault()` | Returns decrypted vault from session RAM |
+| `SAVE_SECRET` | Encrypt password with DEK, save to session | Adds a new credential |
+| `UPDATE_SECRET` | Re-encrypt if password changed, update session | Edits a credential |
+| `DELETE_SECRET` | `SessionManager.deleteSecret(id)` | Removes a credential |
+| `SYNC_VAULT` | `executeSyncVault(payload)` | Full sync pipeline |
+
+### Autofill
+
+| Message | Handler | Description |
+|---|---|---|
+| `GET_DOMAINS_CREDENTIALS` | Filter vault by hostname | Returns matching credential metadata |
+| `AUTOFILL_REQUEST` | Decrypt + send FILL_FIELDS to active tab | Popup-triggered autofill |
+| `INLINE_FILL_REQUEST` | Decrypt by credential ID | Content script autofill |
+| `GET_DECRYPTED` | Decrypt password for display | Password reveal in UI |
+
+### Security Operations
+
+| Message | Handler | Description |
+|---|---|---|
+| `START_LOGIN` | OAuth + zkLogin flow | Returns `{ email, address }` |
+| `CHANGE_MASTER_PASSWORD` | Re-encrypt credentials + trigger sync | Master PIN change |
+| `RECOVER_MASTER_PASSWORD` | Fetch from Sui → decrypt with Recovery → re-wrap | Emergency recovery |
+
+## Session Manager
+
+The `SessionManager` class manages vault session lifecycle using Chrome's `session` storage (RAM-only):
+
+```typescript
+class SessionManager {
+  static async setSession(pin, timeout, cryptoSecret?, dek?) {
+    const expiresAt = timeout === 0
+      ? -1                          // Never expires
+      : Date.now() + (timeout * 60_000);
+    await chrome.storage.session.set({
+      pin, cryptoSecret, dek, expiresAt,
+      vault_last_activity: Date.now()
+    });
+  }
+
+  static async getSession() {
+    // Returns null if PIN missing or session expired
+    // Auto-clears expired sessions
+  }
+
+  static startExpiryListener() {
+    setInterval(() => this.getSession(), 10_000); // 10s poll
+  }
+}
+```
+
+<Callout type="info">
+  `chrome.storage.session` is automatically wiped when the browser process exits. This means closing Chrome immediately locks the vault — no sensitive data survives in local storage.
+</Callout>
+
+---
+
+# Crypto Engine (/extension/crypto-engine)
+
+# Crypto Engine
+
+The `CryptoEngine` class (`src/lib/crypto.ts`) is the cryptographic core of Orion. All encryption and decryption happens **exclusively on the client** — the background service worker and Walrus only ever handle ciphertext.
+
+## Key Hierarchy
+
+```mermaid
+graph TD
+    subgraph User["User Input"]
+        PIN["Master PIN"]
+        RC["Recovery Code"]
+    end
+
+    subgraph KDF["Key Derivation (Argon2id)"]
+        KEK["KEK<br/>(Key Encryption Key)"]
+        RKEK["Recovery KEK"]
+    end
+
+    subgraph Keys["Key Storage"]
+        DEK["DEK<br/>(Data Encryption Key)<br/>Random 256-bit"]
+    end
+
+    subgraph Encrypted["Encrypted Outputs"]
+        EDEK["encryptedDEK<br/>(KEK-wrapped)"]
+        RDEK["recoveryDEK<br/>(Recovery-wrapped)"]
+        EV["vaultPackage<br/>(DEK-encrypted)"]
+    end
+
+    PIN -->|"sha256(pin + address)"| KDF
+    RC -->|"sha256(code + address)"| KDF
+    KDF --> KEK
+    KDF --> RKEK
+    KEK -->|"AES-256-GCM"| EDEK
+    RKEK -->|"AES-256-GCM"| RDEK
+    DEK -->|"AES-256-GCM"| EV
+    DEK -.->|"wrapped by"| EDEK
+    DEK -.->|"wrapped by"| RDEK
+```
+
+## API Reference
+
+### `CryptoEngine.encrypt(plaintext, cryptoSecret)`
+
+Encrypts data using a password-derived key (Argon2id → AES-256-GCM).
+
+**Used for:** Wrapping the DEK with a KEK.
+
+```typescript
+static async encrypt(
+  plaintext: string,
+  cryptoSecret: string
+): Promise<SealedPackage>
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `plaintext` | `string` | Data to encrypt |
+| `cryptoSecret` | `string` | Password material for KDF |
+| **Returns** | `SealedPackage` | `{ ciphertext, iv, salt }` |
+
+**Internal flow:**
+1. Generate 16-byte random salt
+2. Derive AES key via Argon2id (15 iterations, 64MB)
+3. Generate 12-byte random IV
+4. Encrypt with AES-256-GCM
+5. Return Base64-encoded `{ ciphertext, iv, salt }`
+
+---
+
+### `CryptoEngine.decrypt(sealed, cryptoSecret)`
+
+Decrypts a `SealedPackage` using the same password material.
+
+**Used for:** Unwrapping the DEK from a KEK.
+
+```typescript
+static async decrypt(
+  sealed: SealedPackage,
+  cryptoSecret: string
+): Promise<string>
+```
+
+<Callout type="warning">
+  If the `cryptoSecret` is wrong, AES-GCM will throw an `OperationError` (authentication tag mismatch). This is caught and presented as **"Incorrect Master Password"** in the UI.
+</Callout>
+
+---
+
+### `CryptoEngine.generateDEK()`
+
+Generates a cryptographically random 256-bit Data Encryption Key.
+
+```typescript
+static generateDEK(): string {
+  const key = crypto.getRandomValues(new Uint8Array(32));
+  return this.toBase64(key);
+}
+```
+
+**Called once** during vault initialization. The DEK lives for the lifetime of the vault.
+
+---
+
+### `CryptoEngine.encryptWithDEK(plaintext, base64DEK)`
+
+Encrypts data directly with the raw DEK (no KDF step). This is the **fast path** used for encrypting actual vault data.
+
+```typescript
+static async encryptWithDEK(
+  plaintext: string,
+  base64DEK: string
+): Promise<SealedPackage>
+```
+
+**Used for:** Encrypting individual credential passwords and the full vault blob.
+
+**Performance difference:**
+| Method | KDF? | Time per operation |
+|---|---|---|
+| `encrypt()` | Argon2id (15 iter, 64MB) | ~500ms |
+| `encryptWithDEK()` | None (raw key import) | ~1ms |
+
+---
+
+### `CryptoEngine.decryptWithDEK(sealed, base64DEK)`
+
+Decrypts data encrypted with the DEK.
+
+```typescript
+static async decryptWithDEK(
+  sealed: SealedPackage,
+  base64DEK: string
+): Promise<string>
+```
+
+**Used for:** Decrypting individual credential passwords for display and autofill.
+
+## Data Types
+
+### SealedPackage
+
+The universal encryption output format:
+
+```typescript
+interface SealedPackage {
+  ciphertext: string;  // Base64 AES-GCM ciphertext
+  iv: string;          // Base64 12-byte IV
+  salt: string;        // Base64 16-byte salt (empty for DEK operations)
+}
+```
+
+### WrappedVaultPayload
+
+The complete encrypted package stored on Walrus:
+
+```typescript
+interface WrappedVaultPayload {
+  encryptedDEK: SealedPackage;    // DEK encrypted with KEK
+  recoveryDEK?: SealedPackage;    // DEK encrypted with Recovery KEK
+  vaultPackage: SealedPackage;    // Vault data encrypted with DEK
+}
+```
+
+## Security Properties
+
+| Property | Guarantee |
+|---|---|
+| **Forward secrecy** | Each encryption uses a fresh random IV and salt |
+| **Key separation** | DEK (data) and KEK (key wrapping) serve different purposes |
+| **Authentication** | GCM mode provides integrity checking — tampered ciphertext is rejected |
+| **Brute-force resistance** | Argon2id with 64MB memory makes each PIN guess take ~500ms |
+| **No key reuse** | DEK operations use unique IVs; KEK operations use unique salts |
+
+## CredentialManager
+
+The `CredentialManager` class (`src/lib/security.ts`) handles encryption of zkLogin credentials for persistent storage:
+
+```typescript
+class CredentialManager {
+  static async encryptCredentials(
+    jwt: string,
+    zkState: any,
+    zkProof: any,
+    cryptoSecret: string
+  ): Promise<SealedPackage> {
+    const data = JSON.stringify({ jwt, zkState, zkProof });
+    return await CryptoEngine.encrypt(data, cryptoSecret);
+  }
+
+  static async decryptCredentials(
+    sealed: SealedPackage,
+    cryptoSecret: string
+  ): Promise<ProtectedCredentials> {
+    const decryptedJson = await CryptoEngine.decrypt(sealed, cryptoSecret);
+    return JSON.parse(decryptedJson);
+  }
+}
+```
+
+This ensures that the Google JWT and zkLogin proof data are never stored in plaintext — they are wrapped with the user's KEK and can only be recovered by entering the Master PIN.
+
+---
+
+# Walrus Integration (/extension/walrus)
+
+# Walrus Integration
+
+Orion uses **Walrus Protocol** as its decentralized storage layer. All encrypted vault data is stored as content-addressed blobs on the Walrus network, ensuring data permanence and censorship resistance.
+
+## Architecture
+
+```mermaid
+graph LR
+    subgraph Extension
+        BG["Background Worker"]
+        WA["WalrusAdapter"]
+        WC["walrus.ts"]
+    end
+
+    subgraph Walrus["Walrus Network"]
+        PUB["Publisher<br/>PUT /v1/blobs"]
+        AGG["Aggregator<br/>GET /v1/blobs/:id"]
+    end
+
+    BG --> WA
+    WA --> WC
+    WC -->|Upload| PUB
+    WC -->|Download| AGG
+```
+
+## Components
+
+### walrus.ts — Low-Level Client
+
+Handles raw HTTP interactions with Walrus endpoints:
+
+```typescript
+// Upload encrypted blob
+async function storeBlob(
+  data: Uint8Array | Blob,
+  epochs: number = 1
+): Promise<string> {
+  const url = `${WALRUS_PUBLISHER}/v1/blobs?epochs=${epochs}`;
+  const response = await fetch(url, {
+    method: 'PUT',
+    body: data,
+  });
+  // Handle newlyCreated, alreadyCertified, or direct blobId
+  return blobId;
+}
+
+// Download encrypted blob
+async function readBlob(blobId: string): Promise<Uint8Array> {
+  const url = `${WALRUS_AGGREGATOR}/v1/blobs/${blobId}`;
+  const response = await fetch(url);
+  return new Uint8Array(await response.arrayBuffer());
+}
+```
+
+### WalrusAdapter — High-Level Operations
+
+Provides typed operations for the `WrappedVaultPayload`:
+
+```typescript
+class WalrusAdapter {
+  // Serialize, encode, and upload
+  async storeWrappedPayload(
+    payload: WrappedVaultPayload
+  ): Promise<string> {
+    const bytes = new TextEncoder().encode(JSON.stringify(payload));
+    return await storeBlob(bytes);
+  }
+
+  // Download, decode, and deserialize
+  async readWrappedPayload(
+    blobId: string
+  ): Promise<WrappedVaultPayload> {
+    const data = await readBlob(blobId);
+    return JSON.parse(new TextDecoder().decode(data));
+  }
+
+  // Convert Sui RPC blob_id (vector<u8>) to string
+  parseBlobId(rawBlobId: any): string {
+    if (Array.isArray(rawBlobId)) {
+      return new TextDecoder().decode(new Uint8Array(rawBlobId));
+    }
+    return rawBlobId;
+  }
+}
+```
+
+## Endpoints
+
+| Endpoint | URL | Purpose |
+|---|---|---|
+| **Publisher** | `https://publisher.walrus-testnet.walrus.space` | Upload blobs |
+| **Aggregator** | `https://aggregator.walrus-testnet.walrus.space` | Download blobs |
+
+## Response Format
+
+Walrus returns different response shapes depending on whether the blob is new or already exists:
+
+```typescript
+interface WalrusUploadResponse {
+  newlyCreated?: {
+    blobObject: {
+      id: string;
+      blobId: string;
+      storage: { startEpoch: number; endEpoch: number };
+    };
+  };
+  alreadyCertified?: {
+    blobId: string;
+    event: { txDigest: string; eventSeq: string };
+  };
+}
+```
+
+The `storeBlob` function handles both cases transparently, always returning a `blobId` string.
+
+## Data Flow
+
+<Steps>
+
+### Upload (Sync)
+1. Vault data is encrypted with DEK → `vaultPackage`
+2. DEK is wrapped with KEK → `encryptedDEK`
+3. Recovery DEK is preserved → `recoveryDEK`
+4. All three are bundled into `WrappedVaultPayload`
+5. JSON-serialized and uploaded as a binary blob
+6. Walrus returns a content-addressed `blobId`
+7. `blobId` is stored on-chain via `update_key`
+
+### Download (Unlock/Recovery)
+1. `EncryptedVaultKey.walrus_blob_id` is read from Sui
+2. The blob is fetched from the Walrus Aggregator
+3. Parsed into `WrappedVaultPayload`
+4. `encryptedDEK` is decrypted with KEK → DEK
+5. `vaultPackage` is decrypted with DEK → vault data
+
+</Steps>
+
+<Callout type="info">
+  Walrus storage is **content-addressed** — the same encrypted payload always produces the same `blobId`. If nothing changed, the upload is a no-op (`alreadyCertified` response).
+</Callout>

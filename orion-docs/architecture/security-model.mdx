@@ -1,0 +1,161 @@
+---
+title: Security Model
+description: Threat model, cryptographic design, and defense-in-depth strategy for the Orion Password Manager.
+---
+
+# Security Model
+
+Orion implements a **defense-in-depth** security architecture. Every layer — from user input to blockchain finality — is designed to ensure that **no single point of compromise** can expose plaintext credentials.
+
+## Threat Model
+
+| Threat | Mitigation |
+|---|---|
+| **Compromised local storage** | All data at rest is AES-256-GCM encrypted. The DEK is never stored in plaintext — only wrapped by the KEK (derived from the Master PIN). |
+| **Brute-force Master PIN** | Argon2id with 15 iterations and 64MB memory makes each guess take ~500ms, even on modern hardware. |
+| **Man-in-the-middle (Walrus)** | All data uploaded to Walrus is already encrypted client-side. Walrus only ever sees ciphertext. |
+| **Malicious content script injection** | The autofill UI uses **Shadow DOM** isolation. CSS/JS on the host page cannot read or tamper with Orion's injected UI. |
+| **Phishing via similar domains** | Domain matching uses **strict hostname comparison** — `evil-github.com` will never match credentials saved for `github.com`. |
+| **Session hijacking** | Sensitive session data (DEK, PIN, zkLogin JWT) is stored in `chrome.storage.session` (RAM-only) and auto-expires via a configurable timeout. |
+| **Replay attacks on-chain** | Each `EncryptedVaultKey` has a monotonically incrementing `version` field. Stale updates are detectable. |
+| **Race conditions during sync** | The background service worker uses a **serial queue** (`syncPromise` chaining) to prevent concurrent Walrus/Sui updates. |
+
+## Cryptographic Primitives
+
+### Key Derivation — Argon2id
+
+```typescript
+// From: src/lib/crypto.ts
+const hash = await argon2id({
+  password: cryptoSecret,
+  salt: salt,              // 16 bytes, cryptographically random
+  parallelism: 1,
+  iterations: 15,          // Hardened from default
+  memorySize: 65536,       // 64 MB — GPU/ASIC resistant
+  hashLength: 32,          // 256-bit output
+  outputType: 'binary',
+});
+```
+
+<Callout type="info">
+  Argon2id is the **winner of the Password Hashing Competition (PHC)** and is recommended by OWASP for password storage. It combines Argon2i's resistance to side-channel attacks with Argon2d's resistance to GPU cracking.
+</Callout>
+
+### Encryption — AES-256-GCM
+
+Every encryption operation generates:
+- A fresh **16-byte random salt** (for KDF-based encryption) or uses a raw key (for DEK-based encryption)
+- A fresh **12-byte random IV** (initialization vector)
+- A **ciphertext** with integrated authentication tag (GCM mode)
+
+```typescript
+interface SealedPackage {
+  ciphertext: string; // Base64-encoded AES-GCM output
+  iv: string;         // Base64-encoded 12-byte IV
+  salt: string;       // Base64-encoded 16-byte salt
+}
+```
+
+### Vault Payload Structure
+
+The complete encrypted payload stored on Walrus:
+
+```typescript
+interface WrappedVaultPayload {
+  encryptedDEK: SealedPackage;   // DEK encrypted with KEK (Master PIN)
+  recoveryDEK?: SealedPackage;   // DEK encrypted with Recovery KEK
+  vaultPackage: SealedPackage;   // Vault data encrypted with DEK
+}
+```
+
+## Session Security
+
+Orion uses Chrome's **session storage** (`chrome.storage.session`) which exists only in RAM and is automatically cleared when the browser closes.
+
+### Stored in Session (RAM-only)
+| Key | Purpose | Auto-cleared? |
+|---|---|---|
+| `pin` | Master PIN hash | ✅ On timeout or browser close |
+| `cryptoSecret` | Derived KEK material | ✅ On timeout or browser close |
+| `dek` | Data Encryption Key | ✅ On timeout or browser close |
+| `vault` | Decrypted vault entries | ✅ On timeout or browser close |
+| `jwt` | Google OAuth JWT | ✅ On timeout or browser close |
+
+### Stored in Local Storage (Encrypted)
+| Key | Purpose | Encryption |
+|---|---|---|
+| `encrypted_vault` | Offline vault cache | AES-256-GCM (DEK) |
+| `encrypted_zk_credentials` | JWT + zkState + zkProof | AES-256-GCM (KEK) |
+| `orion_seal_object_id` | Sui object reference | None (non-sensitive) |
+| `orion_sui_address` | User's zkLogin address | None (public data) |
+
+### Auto-Lock Timeout
+
+Users can configure session timeout from the extension settings:
+
+| Option | Duration | Use Case |
+|---|---|---|
+| Maximum Security | 1 minute | Public/shared computers |
+| Balanced | 15 minutes | Default — recommended |
+| Standard | 1 hour | Personal workstations |
+| Never | ∞ | Trusted devices only |
+
+The background service worker runs a 10-second polling interval to check and enforce session expiry.
+
+## Domain Matching (Anti-Phishing)
+
+The autofill engine uses **strict hostname matching** to prevent phishing attacks:
+
+```typescript
+// From: src/extension/background.ts
+const searchDomain = domain.toLowerCase().replace(/^www\./, '');
+const urlObj = new URL(entryUrl.startsWith('http') ? entryUrl : `https://${entryUrl}`);
+const entryDomain = urlObj.hostname.replace(/^www\./, '');
+
+// Must match exactly or be a subdomain
+return entryDomain === searchDomain
+    || entryDomain.endsWith(`.${searchDomain}`);
+```
+
+This means:
+- ✅ `github.com` matches credentials saved for `github.com`
+- ✅ `gist.github.com` matches credentials saved for `github.com` (subdomain)
+- ❌ `evil-github.com` does **NOT** match
+- ❌ `github.com.evil.com` does **NOT** match
+
+## Sync Concurrency Control
+
+To prevent **race conditions** when multiple CRUD operations fire in rapid succession, the background service worker implements a **serial queue**:
+
+```typescript
+// From: src/extension/background.ts
+let syncPromise: Promise<any> = Promise.resolve();
+
+async function executeSyncVault(payload: any) {
+  syncPromise = syncPromise.then(async () => {
+    // ... encrypt → upload to Walrus → update Sui ...
+  });
+  return syncPromise;
+}
+```
+
+This guarantees that each sync operation completes fully (Walrus upload + Sui update) before the next one begins, preventing data loss or version conflicts on-chain.
+
+## Recovery System
+
+The **Emergency Kit** recovery system provides a safe escape hatch when the Master PIN is forgotten:
+
+<Steps>
+### Step 1: Generate Recovery Code
+During vault initialization, a one-time Recovery Code is generated. The DEK is encrypted with both the Master KEK and the Recovery KEK.
+
+### Step 2: Store Both Wrappers
+Both `encryptedDEK` (KEK-wrapped) and `recoveryDEK` (Recovery KEK-wrapped) are stored together in the Walrus blob.
+
+### Step 3: Recovery Flow
+The user provides the Recovery Code. The system fetches the latest `EncryptedVaultKey` from Sui, downloads the blob from Walrus, decrypts the DEK using the Recovery KEK, and re-wraps it with a new Master KEK.
+</Steps>
+
+<Callout type="warning">
+  The Recovery Code is shown **once** during initialization. It is never stored by Orion. Users must save it offline (printed paper, hardware vault, etc.).
+</Callout>

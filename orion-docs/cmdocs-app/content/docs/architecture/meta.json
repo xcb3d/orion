@@ -1,0 +1,11 @@
+{
+  "title": "Architecture",
+  "description": "System architecture, security model, and authentication flow",
+  "root": true,
+  "pages": [
+    "---System Design---",
+    "overview",
+    "security-model",
+    "authentication"
+  ]
+}
